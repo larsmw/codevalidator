@@ -1,5 +1,27 @@
+# virtualenv / packaging
 .venv/
+venv/
+*.egg-info/
+*.egg
+build/
+dist/
+
+# bytecode / caches
 __pycache__/
 *.pyc
-*.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# secrets - never commit real credentials, even ones created for local testing
+.env
+.env.*
+*.pem
+*.key
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
