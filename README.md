@@ -1,37 +1,62 @@
 # codevalidator
 
-Scans a repository for signs that its code doesn't do what it claims to — hardcoded
-secrets, dynamic-code-execution backdoors, data exfiltration, supply-chain tampering,
-CI/git-hook abuse, and (via an LLM pass) subtler logic that regexes can't catch, like
-a hardcoded bypass condition or behavior that contradicts a function's own name.
+A diff-focused code review helper for catching things *deliberately or accidentally
+hidden* in a change - a backdoor slipped in by an LLM coding assistant, a compromised
+contributor, or a supply-chain compromise. Combines fast deterministic checks with an
+LLM review pass, and is built to layer on top of (not duplicate) what dedicated tools
+like gitleaks, Semgrep, or Socket.dev already do well.
 
-Built for the specific worry that an LLM coding assistant (or a human, or a compromised
-dependency) slipped something malicious into a codebase that looks fine on a skim.
+## Why this exists, and what it isn't
+
+Secret scanning, static analysis, and supply-chain scanning are mature, well-solved
+problems - gitleaks/trufflehog scan full git history and live-verify leaked keys;
+Semgrep/CodeQL do real AST/dataflow analysis across files; Socket.dev/OSSF Scorecard
+track dependency *behavior* and reputation. codevalidator doesn't try to out-build any
+of those. What it targets instead is the gap none of them cover well: code that was
+*deliberately made to look like something it isn't* - a hardcoded bypass condition,
+a change that quietly does more than its commit message claims, a test weakened in the
+same diff as the logic it would have caught. That's a different question than "does
+this match a known-bad pattern," and it's why half of this tool is an LLM asking "does
+this diff actually do what it says" rather than more regexes.
+
+Use `--diff` as the default way to run this - reviewing a specific change against its
+stated intent is the strongest signal this tool has. Whole-repo scanning still works
+(and the heuristic scanners are useful defense-in-depth on their own), but a full-repo
+LLM pass is the weakest and most expensive way to use this tool.
 
 ## Install
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e .
+
+# to use Mistral instead of (or alongside) Anthropic:
+.venv/bin/pip install -e ".[mistral]"
 ```
+
+Needs credentials for whichever LLM provider(s) you use: `ANTHROPIC_API_KEY` (or
+`ant auth login`) for Anthropic, `MISTRAL_API_KEY` for Mistral. Heuristic-only scans
+(`--no-llm`) need no credentials at all.
 
 ## Usage
 
 ```bash
-# Full scan: heuristics + LLM semantic review
-codevalidator /path/to/repo
-
-# Heuristics only, no API calls
-codevalidator /path/to/repo --no-llm
-
-# Review only uncommitted changes (fast, focused, cheap - good for "did the
-# assistant that just wrote this diff sneak anything in")
-codevalidator /path/to/repo --diff HEAD
+# Review a diff against its stated purpose - the core workflow
+codevalidator /path/to/repo --diff HEAD --intent "Refactor the retry logic in the HTTP client"
 
 # Review a PR branch against main
-codevalidator /path/to/repo --diff main...feature-branch
+codevalidator /path/to/repo --diff main...feature-branch --intent-file pr-description.txt
+
+# Cross-check the same diff through both Anthropic and Mistral
+codevalidator /path/to/repo --diff HEAD --llm-provider both
+
+# Heuristics only, no API calls, no cost
+codevalidator /path/to/repo --diff HEAD --no-llm
+
+# Whole-repo scan (heuristics + LLM, capped at --llm-max-files for cost)
+codevalidator /path/to/repo
 
 # JSON for scripting / CI, non-zero exit only on critical findings
-codevalidator /path/to/repo --format json --fail-on critical -o report.json
+codevalidator /path/to/repo --diff HEAD --format json --fail-on critical -o report.json
 ```
 
 Exit code is `1` if any finding at or above `--fail-on` (default: `high`) is present,
@@ -39,45 +64,77 @@ so it can gate a pre-commit hook or CI job once you're happy with the noise leve
 
 ## How it works
 
-Two independent passes, deliberately overlapping in coverage:
+Three layers, all merged into one `Finding` list (severity, category, file:line,
+evidence, confidence) and deduped/sorted into a single report:
 
-1. **Heuristic scanners** (`src/codevalidator/scanners/`) - fast, free, deterministic
-   regex/structural checks: hardcoded credentials, `eval`/`exec`/`pickle.loads` and
-   other dynamic-execution sinks (especially `decode(...) -> exec(...)` chains),
+1. **Heuristic scanners** (`src/codevalidator/scanners/`) - fast, free, deterministic,
+   whole-repo. Hardcoded credentials, `eval`/`exec`/`pickle.loads` and other
+   dynamic-execution sinks (especially `decode(...) -> exec(...)` chains),
    reverse-shell shapes, Unicode "Trojan Source" bidi/zero-width tricks
    (CVE-2021-42574), `npm`/pip install-time scripts, insecure/overridden dependency
    sources, `pull_request_target` privilege-escalation in GitHub Actions, malicious
    git/husky hooks, and unusual file permissions.
-2. **LLM semantic review** (`src/codevalidator/llm_review.py`) - sends source (or,
-   with `--diff`, just the diff) to Claude with a rubric aimed at what regexes
-   structurally cannot see: logic that behaves differently for a hardcoded trigger
-   value, an inverted auth check, code whose behavior contradicts its own name or
-   comments, unnecessary indirection whose only effect is to hide a change. File
-   content is explicitly treated as untrusted data in the prompt, with an instruction
-   to ignore and flag anything in it that looks like a prompt-injection attempt.
 
-Both passes emit the same `Finding` shape (severity, category, file:line, evidence,
-confidence) and get merged, deduped, and sorted into one report.
+2. **Diff heuristics** (`src/codevalidator/diff_heuristics.py`) - fast, free,
+   deterministic, only with `--diff` (they need a before/after to mean anything):
+   - **Test tampering**: a test assertion removed or a test skipped in the same diff
+     as production code changes - the classic "neuter the test that would catch it"
+     pattern. Severity escalates to `HIGH` specifically when non-test files change too.
+   - **Author anomaly**: a security-sensitive path (auth, CI config, crypto, payments,
+     migrations, ...) touched by an author with no prior git history on that file.
+     Approximate by nature (git history is read from the current checked-out state) -
+     treat it as "worth a second reviewer," not proof of anything.
+
+3. **LLM semantic review** (`src/codevalidator/llm_review.py`, `providers.py`) - the
+   part that reads for intent, not just pattern. Sends source (or, with `--diff`, the
+   diff itself) to Claude or Mistral with a rubric aimed at what the above can't see:
+   logic that behaves differently for a hardcoded trigger value, an inverted auth
+   check, code whose behavior contradicts its own name or comments. With `--intent`,
+   it additionally checks whether every part of the diff serves the stated purpose,
+   flagging unrelated riders as `scope-creep` - a common way to bundle a malicious
+   change into an otherwise-legitimate diff. File content is explicitly treated as
+   untrusted data in the prompt, with an instruction to ignore and flag anything in it
+   that looks like a prompt-injection attempt.
+
+   `--llm-provider both` runs the review through Anthropic *and* Mistral and
+   cross-checks results (`llm_review.cross_check`): findings independently
+   corroborated by both models on the same file/nearby line get flagged and
+   confidence-boosted. **Findings from only one model are never suppressed or
+   downgraded** - the point of cross-checking is that disagreement is itself a signal
+   worth a look, not a reason to hide something one model caught and the other missed.
+   Roughly doubles LLM cost/tokens. If only one provider has credentials configured,
+   it degrades gracefully to that one instead of failing outright.
+
+   Every LLM run reports token usage (`LLM usage: N calls, X input, Y output tokens`)
+   in the report - raw counts as returned by the API, deliberately with **no dollar
+   estimate**, since hardcoded pricing drifts out of date or varies by account.
+   Failed batches (rate limits, API errors) are called out explicitly rather than
+   silently producing an incomplete "no findings" report.
 
 ## Known limitations
 
 - **Not a guarantee.** A clean report is evidence, not proof. This raises the cost of
   hiding something; it doesn't make hiding something impossible.
+- **Not a replacement for gitleaks/Semgrep/a dependency-vuln scanner.** Those do their
+  respective jobs (secret history scanning, AST/dataflow analysis, CVE matching) far
+  more thoroughly than the heuristic scanners here, which are intentionally lightweight.
 - **Regex scanners will flag their own pattern definitions and test fixtures** if you
   point codevalidator at its own source - the patterns for "netcat reverse shell" or
   "credential read near a network call" *contain* the strings they're looking for.
-  This is an inherent, well-known property of this technique (the same thing happens
-  scanning grep's own source with grep), not a bug. Use `--exclude` for known
+  Same as grepping grep's own source with grep, not a bug. Use `--exclude` for known
   fixture/test paths if it's noisy.
-- **LLM review has a file/size cap** (`--llm-max-files`, default 80; ~20K chars/file)
-  to bound cost on large repos. `--diff` sidesteps this entirely by only reviewing
-  what changed - prefer it for anything beyond a one-time full audit.
+- **Whole-repo LLM review has a file/size cap** (`--llm-max-files`, default 80; ~20K
+  chars/file) to bound cost. `--diff` sidesteps this entirely by only reviewing what
+  changed - it's the intended way to use this tool, not just a cost workaround.
+- **Author-anomaly is approximate.** It reads git history from whatever's currently
+  checked out, which may or may not cleanly exclude the diff's own commits depending
+  on branch topology. Treat it as a prior worth a look, not a verdict.
 - Confidence is reported honestly per finding; treat `low`-confidence findings as
   "worth a human glance," not "confirmed."
 
 ## Development
 
 ```bash
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ".[dev,mistral]"
 .venv/bin/pytest
 ```
