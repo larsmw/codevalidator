@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from codevalidator.models import ScanContext, ScannedFile
-from codevalidator.scanners import dangerous_exec, obfuscation, secrets, supply_chain
+from codevalidator.scanners import dangerous_exec, network_exfil, obfuscation, secrets, supply_chain
 
 
 def _ctx(rel_path: str, content: str) -> ScanContext:
@@ -51,6 +51,18 @@ def test_supply_chain_flags_postinstall_curl_pipe_bash():
     ctx = _ctx("package.json", pkg)
     findings = supply_chain.scan(ctx)
     assert any(f.category == "install-time-script" and f.severity.name == "HIGH" for f in findings)
+
+
+def test_network_exfil_ignores_rfc_section_reference():
+    ctx = _ctx("RobotsParser.php", '// RFC 9309 §2.3.1.4: fail closed while robots.txt is unreachable\n')
+    findings = network_exfil.scan(ctx)
+    assert findings == []
+
+
+def test_network_exfil_flags_hardcoded_ip():
+    ctx = _ctx("beacon.py", 'HOST = "203.0.113.42:4444"  # phone home\n')
+    findings = network_exfil.scan(ctx)
+    assert any(f.category == "hardcoded-ip" for f in findings)
 
 
 def test_supply_chain_ignores_benign_postinstall():

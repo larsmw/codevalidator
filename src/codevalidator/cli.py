@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import llm_review, report
+from . import llm_review, providers, report
 from .models import ScanContext, Severity
 from .scanners import ALL_SCANNERS, run_all
 from .walker import collect_files
@@ -36,7 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="With --diff, also restrict heuristic scanners to the changed files only.")
     p.add_argument("--llm", dest="llm", action="store_true", default=True, help="Run the LLM semantic review pass (default).")
     p.add_argument("--no-llm", dest="llm", action="store_false", help="Skip the LLM review pass; heuristics only.")
-    p.add_argument("--llm-model", default=llm_review.MODEL, help=f"Model for LLM review (default: {llm_review.MODEL})")
+    p.add_argument("--llm-provider", choices=list(providers.DEFAULT_MODELS), default=llm_review.DEFAULT_PROVIDER,
+                    help=f"Which LLM API to use for the review pass (default: {llm_review.DEFAULT_PROVIDER}). "
+                         "anthropic reads ANTHROPIC_API_KEY, mistral reads MISTRAL_API_KEY.")
+    p.add_argument("--llm-model", default=None,
+                    help="Model for LLM review (default depends on --llm-provider: "
+                         + ", ".join(f"{p}={m}" for p, m in providers.DEFAULT_MODELS.items()) + ")")
     p.add_argument("--llm-max-files", type=int, default=llm_review.DEFAULT_MAX_FILES,
                     help="Cap on files sent through LLM review in whole-repo mode (default: %(default)s)")
     p.add_argument("--scanners", default=None,
@@ -77,12 +82,16 @@ def main(argv: list[str] | None = None) -> int:
     ctx = ScanContext(repo_root=repo_root, files=files)
     findings = run_all(ctx, only=only_scanners)
 
+    usage = None
     if args.llm:
         try:
             if args.diff:
-                findings.extend(llm_review.review_diff(repo_root, args.diff, model=args.llm_model))
+                llm_findings, usage = llm_review.review_diff(
+                    repo_root, args.diff, provider=args.llm_provider, model=args.llm_model)
             else:
-                findings.extend(llm_review.review_repo(ctx, model=args.llm_model, max_files=args.llm_max_files))
+                llm_findings, usage = llm_review.review_repo(
+                    ctx, provider=args.llm_provider, model=args.llm_model, max_files=args.llm_max_files)
+            findings.extend(llm_findings)
         except llm_review.LLMUnavailable as e:
             print(f"warning: {e}", file=sys.stderr)
         except RuntimeError as e:
@@ -93,12 +102,12 @@ def main(argv: list[str] | None = None) -> int:
     findings = [f for f in findings if f.severity >= threshold]
 
     if args.format == "json":
-        out = report.render_json(findings, str(repo_root))
+        out = report.render_json(findings, str(repo_root), usage=usage)
     elif args.format == "markdown":
-        out = report.render_markdown(findings, str(repo_root))
+        out = report.render_markdown(findings, str(repo_root), usage=usage)
     else:
         use_color = False if args.no_color else None  # None -> auto-detect tty in render_text
-        out = report.render_text(findings, str(repo_root), use_color=use_color)
+        out = report.render_text(findings, str(repo_root), use_color=use_color, usage=usage)
 
     if args.output:
         Path(args.output).write_text(out + "\n")

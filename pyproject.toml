@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+mistral = ["mistralai>=2.9"]
 
 [project.scripts]
 codevalidator = "codevalidator.cli:main"

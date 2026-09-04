@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 from typing import Literal
 
-import anthropic
 from pydantic import BaseModel
 
-from .models import Finding, ScanContext, Severity
+from . import providers
+from .models import Finding, ScanContext, Severity, TokenUsage
+from .providers import LLMUnavailable  # re-exported for callers
 
-MODEL = "claude-opus-5"
+DEFAULT_PROVIDER = "anthropic"
 
 # Keep individual LLM requests bounded - both for cost and because a single
 # giant request is worse at precise line-level findings than several focused ones.
@@ -94,40 +94,8 @@ def _to_finding(lf: LLMFinding) -> Finding:
     )
 
 
-class LLMUnavailable(Exception):
-    """Raised when the LLM pass can't run at all (bad/missing credentials)."""
-
-
-def _call(client: anthropic.Anthropic, model: str, user_content: str) -> LLMBatchResult | None:
-    try:
-        response = client.messages.parse(
-            model=model,
-            max_tokens=16000,
-            system=_REVIEW_RUBRIC,
-            messages=[{"role": "user", "content": user_content}],
-            output_format=LLMBatchResult,
-        )
-    except (anthropic.AuthenticationError, TypeError) as e:
-        # The SDK raises a bare TypeError (not an AuthenticationError) when it can't
-        # resolve any credentials at all, before a request is even built.
-        if isinstance(e, TypeError) and "authentication" not in str(e).lower():
-            raise
-        raise LLMUnavailable(
-            f"Anthropic authentication failed ({e}). Set ANTHROPIC_API_KEY, or run `ant auth login`, "
-            "or pass --no-llm to skip the LLM review pass."
-        ) from e
-    except anthropic.NotFoundError as e:
-        raise LLMUnavailable(f"Model '{model}' not found or unavailable: {e}") from e
-    except anthropic.RateLimitError as e:
-        print(f"warning: rate limited on LLM review batch, skipping it: {e}", file=sys.stderr)
-        return None
-    except anthropic.APIStatusError as e:
-        print(f"warning: LLM review batch failed ({e.status_code}): {e}", file=sys.stderr)
-        return None
-    except anthropic.APIConnectionError as e:
-        print(f"warning: network error during LLM review batch: {e}", file=sys.stderr)
-        return None
-    return response.parsed_output
+def _call(provider: str, model: str, user_content: str, usage: TokenUsage) -> LLMBatchResult | None:
+    return providers.call(provider, model, _REVIEW_RUBRIC, user_content, LLMBatchResult, usage)
 
 
 def _batches_from_files(files) -> list[list]:
@@ -161,8 +129,14 @@ def _render_batch(files) -> str:
     return "\n".join(parts)
 
 
-def review_repo(ctx: ScanContext, model: str = MODEL, max_files: int = DEFAULT_MAX_FILES) -> list[Finding]:
-    client = anthropic.Anthropic()
+def review_repo(
+    ctx: ScanContext,
+    provider: str = DEFAULT_PROVIDER,
+    model: str | None = None,
+    max_files: int = DEFAULT_MAX_FILES,
+) -> tuple[list[Finding], TokenUsage]:
+    model = model or providers.DEFAULT_MODELS[provider]
+    usage = TokenUsage(provider=provider, model=model)
     reviewable = [f for f in ctx.files if f.content is not None
                   and Path(f.rel_path).name not in _SKIP_NAMES
                   and Path(f.rel_path).suffix not in _SKIP_SUFFIXES]
@@ -172,10 +146,13 @@ def review_repo(ctx: ScanContext, model: str = MODEL, max_files: int = DEFAULT_M
         reviewable = sorted(reviewable, key=lambda f: f.rel_path)[:max_files]
         truncated_repo = True
 
+    batches = _batches_from_files(reviewable)
     findings: list[Finding] = []
-    for batch in _batches_from_files(reviewable):
-        result = _call(client, model, _render_batch(batch))
+    failed_batches = 0
+    for batch in batches:
+        result = _call(provider, model, _render_batch(batch), usage)
         if result is None:
+            failed_batches += 1
             continue
         findings.extend(_to_finding(lf) for lf in result.findings)
 
@@ -188,7 +165,23 @@ def review_repo(ctx: ScanContext, model: str = MODEL, max_files: int = DEFAULT_M
                     "Use --diff to focus review on recent changes, or raise --llm-max-files.",
             confidence="high",
         ))
-    return findings
+    _append_failed_batch_finding(findings, failed_batches, len(batches))
+    return findings, usage
+
+
+def _append_failed_batch_finding(findings: list[Finding], failed: int, total: int) -> None:
+    if failed == 0:
+        return
+    findings.append(Finding(
+        scanner="llm", severity=Severity.MEDIUM, category="incomplete-review",
+        file="(repo)",
+        summary=f"{failed} of {total} LLM review batch(es) failed (rate limit, API error, or network "
+                "issue - see stderr for details) and were skipped. The LLM pass did NOT cover those "
+                "files; a report with few/no LLM findings after batch failures is NOT evidence those "
+                "files are clean. Re-run (transient errors often clear up), reduce --llm-max-files, "
+                "or check your provider's rate limits.",
+        confidence="high",
+    ))
 
 
 def get_diff_text(repo_root: Path, diff_spec: str) -> str:
@@ -201,12 +194,15 @@ def get_diff_text(repo_root: Path, diff_spec: str) -> str:
     return result.stdout
 
 
-def review_diff(repo_root: Path, diff_spec: str, model: str = MODEL) -> list[Finding]:
+def review_diff(
+    repo_root: Path, diff_spec: str, provider: str = DEFAULT_PROVIDER, model: str | None = None
+) -> tuple[list[Finding], TokenUsage]:
+    model = model or providers.DEFAULT_MODELS[provider]
+    usage = TokenUsage(provider=provider, model=model)
     diff_text = get_diff_text(repo_root, diff_spec)
     if not diff_text.strip():
-        return []
+        return [], usage
 
-    client = anthropic.Anthropic()
     findings: list[Finding] = []
     # chunk the diff by file boundary to stay under batch size
     chunks: list[str] = []
@@ -219,14 +215,18 @@ def review_diff(repo_root: Path, diff_spec: str, model: str = MODEL) -> list[Fin
     if current:
         chunks.append(current)
 
+    failed_batches = 0
     for chunk in chunks:
         prompt = (
             "Review the following unified git diff. Line numbers you report should be "
             "new-file line numbers, derived from the diff hunk headers (@@ -a,b +c,d @@).\n\n"
             f"```diff\n{chunk}\n```"
         )
-        result = _call(client, model, prompt)
+        result = _call(provider, model, prompt, usage)
         if result is None:
+            failed_batches += 1
             continue
         findings.extend(_to_finding(lf) for lf in result.findings)
-    return findings
+
+    _append_failed_batch_finding(findings, failed_batches, len(chunks))
+    return findings, usage

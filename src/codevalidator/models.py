@@ -58,3 +58,26 @@ class ScanContext:
     def with_suffix(self, *suffixes: str) -> list[ScannedFile]:
         wanted = set(suffixes)
         return [f for f in self.files if Path(f.rel_path).suffix in wanted]
+
+
+@dataclass
+class TokenUsage:
+    """Raw token counts as reported by the LLM API - no cost estimate.
+
+    Provider pricing changes over time and varies by account (volume
+    discounts, enterprise rates), so a hardcoded $/token conversion here
+    would drift out of date or simply be wrong. Report exactly what the API
+    told us and let the user check it against their own provider dashboard.
+    """
+
+    provider: str
+    model: str
+    calls: int = 0
+    failed_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0  # Anthropic prompt-cache reads, billed at a fraction of input rate
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
