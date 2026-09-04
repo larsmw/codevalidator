@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import llm_review, providers, report
+from . import diff_heuristics, llm_review, providers, report
 from .models import ScanContext, Severity
 from .scanners import ALL_SCANNERS, run_all
 from .walker import collect_files
@@ -34,6 +34,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "uncommitted changes). Heuristic scanners still run repo-wide unless --changed-only.")
     p.add_argument("--changed-only", action="store_true",
                     help="With --diff, also restrict heuristic scanners to the changed files only.")
+    intent_group = p.add_mutually_exclusive_group()
+    intent_group.add_argument("--intent", default=None, metavar="TEXT",
+                    help="Stated purpose of the change being reviewed (PR description, ticket text, etc.) "
+                         "- only used with --diff. The LLM flags parts of the diff that don't serve this "
+                         "stated intent (scope creep is a common way to hide a change in a legitimate-"
+                         "looking diff).")
+    intent_group.add_argument("--intent-file", default=None, metavar="PATH",
+                    help="Read --intent text from a file instead of the command line.")
     p.add_argument("--llm", dest="llm", action="store_true", default=True, help="Run the LLM semantic review pass (default).")
     p.add_argument("--no-llm", dest="llm", action="store_false", help="Skip the LLM review pass; heuristics only.")
     p.add_argument("--llm-provider", choices=list(providers.DEFAULT_MODELS), default=llm_review.DEFAULT_PROVIDER,
@@ -72,6 +80,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: unknown scanner(s): {', '.join(sorted(unknown))}", file=sys.stderr)
             return 2
 
+    intent = args.intent
+    if args.intent_file:
+        intent = Path(args.intent_file).read_text()
+    if intent and not args.diff:
+        print("warning: --intent/--intent-file only applies with --diff, ignoring", file=sys.stderr)
+        intent = None
+
     files = collect_files(repo_root, extra_excludes=args.exclude)
 
     if args.diff and args.changed_only:
@@ -82,12 +97,19 @@ def main(argv: list[str] | None = None) -> int:
     ctx = ScanContext(repo_root=repo_root, files=files)
     findings = run_all(ctx, only=only_scanners)
 
+    if args.diff:
+        try:
+            diff_text = llm_review.get_diff_text(repo_root, args.diff)
+            findings.extend(diff_heuristics.check_test_tampering(diff_text))
+        except RuntimeError as e:
+            print(f"warning: {e}", file=sys.stderr)
+
     usage = None
     if args.llm:
         try:
             if args.diff:
                 llm_findings, usage = llm_review.review_diff(
-                    repo_root, args.diff, provider=args.llm_provider, model=args.llm_model)
+                    repo_root, args.diff, provider=args.llm_provider, model=args.llm_model, intent=intent)
             else:
                 llm_findings, usage = llm_review.review_repo(
                     ctx, provider=args.llm_provider, model=args.llm_model, max_files=args.llm_max_files)
