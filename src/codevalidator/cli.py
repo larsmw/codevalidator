@@ -44,12 +44,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Read --intent text from a file instead of the command line.")
     p.add_argument("--llm", dest="llm", action="store_true", default=True, help="Run the LLM semantic review pass (default).")
     p.add_argument("--no-llm", dest="llm", action="store_false", help="Skip the LLM review pass; heuristics only.")
-    p.add_argument("--llm-provider", choices=list(providers.DEFAULT_MODELS), default=llm_review.DEFAULT_PROVIDER,
+    p.add_argument("--llm-provider", choices=[*providers.DEFAULT_MODELS, "both"], default=llm_review.DEFAULT_PROVIDER,
                     help=f"Which LLM API to use for the review pass (default: {llm_review.DEFAULT_PROVIDER}). "
-                         "anthropic reads ANTHROPIC_API_KEY, mistral reads MISTRAL_API_KEY.")
+                         "anthropic reads ANTHROPIC_API_KEY, mistral reads MISTRAL_API_KEY. 'both' runs the "
+                         "same review through both providers (roughly doubles cost/tokens) and cross-checks "
+                         "results - findings independently corroborated by both models are marked as such; "
+                         "findings from only one model are still shown at full severity, never suppressed.")
     p.add_argument("--llm-model", default=None,
                     help="Model for LLM review (default depends on --llm-provider: "
-                         + ", ".join(f"{p}={m}" for p, m in providers.DEFAULT_MODELS.items()) + ")")
+                         + ", ".join(f"{p}={m}" for p, m in providers.DEFAULT_MODELS.items()) +
+                         "). Ignored when --llm-provider both is used - each provider runs its own default model.")
     p.add_argument("--llm-max-files", type=int, default=llm_review.DEFAULT_MAX_FILES,
                     help="Cap on files sent through LLM review in whole-repo mode (default: %(default)s)")
     p.add_argument("--scanners", default=None,
@@ -101,18 +105,35 @@ def main(argv: list[str] | None = None) -> int:
         try:
             diff_text = llm_review.get_diff_text(repo_root, args.diff)
             findings.extend(diff_heuristics.check_test_tampering(diff_text))
+            findings.extend(diff_heuristics.check_author_anomaly(repo_root, args.diff))
         except RuntimeError as e:
             print(f"warning: {e}", file=sys.stderr)
 
-    usage = None
+    usage: list = []
     if args.llm:
+        if args.llm_provider == "both":
+            if args.llm_model:
+                print("warning: --llm-model is ignored with --llm-provider both", file=sys.stderr)
+            llm_providers, model_kwargs = ["anthropic", "mistral"], {}
+        else:
+            llm_providers, model_kwargs = [args.llm_provider], {"model": args.llm_model}
         try:
             if args.diff:
-                llm_findings, usage = llm_review.review_diff(
-                    repo_root, args.diff, provider=args.llm_provider, model=args.llm_model, intent=intent)
+                if len(llm_providers) > 1:
+                    llm_findings, usage = llm_review.review_diff_multi(
+                        repo_root, args.diff, llm_providers=llm_providers, intent=intent)
+                else:
+                    llm_findings, one_usage = llm_review.review_diff(
+                        repo_root, args.diff, provider=llm_providers[0], intent=intent, **model_kwargs)
+                    usage = [one_usage]
             else:
-                llm_findings, usage = llm_review.review_repo(
-                    ctx, provider=args.llm_provider, model=args.llm_model, max_files=args.llm_max_files)
+                if len(llm_providers) > 1:
+                    llm_findings, usage = llm_review.review_repo_multi(
+                        ctx, llm_providers=llm_providers, max_files=args.llm_max_files)
+                else:
+                    llm_findings, one_usage = llm_review.review_repo(
+                        ctx, provider=llm_providers[0], max_files=args.llm_max_files, **model_kwargs)
+                    usage = [one_usage]
             findings.extend(llm_findings)
         except llm_review.LLMUnavailable as e:
             print(f"warning: {e}", file=sys.stderr)

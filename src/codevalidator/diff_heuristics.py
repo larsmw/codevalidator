@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 from .models import Finding, Severity
+
+_SENSITIVE_PATH_RE = re.compile(
+    r"(?i)(auth|login|session|token|crypto|secret|password|permission|privilege|admin|"
+    r"payment|billing|\.github/workflows|dockerfile|terraform|\.tf$|migrations?/|"
+    r"\bci\.ya?ml$|security)"
+)
 
 _TEST_DIR_RE = re.compile(r"(?i)(^|/)(tests?|specs?|__tests__)(/|$)")
 _TEST_FILE_RE = re.compile(r"(?i)(^test_|_test\.|\.test\.|\.spec\.|_spec\.|Test\.\w+$|Tests\.\w+$)")
@@ -119,4 +127,89 @@ def check_test_tampering(diff_text: str) -> list[Finding]:
                     evidence=dl.text.strip()[:160],
                     confidence="medium",
                 ))
+    return findings
+
+
+def _git(repo_root: Path, *args: str, timeout: int = 15) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *args], capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _is_range_spec(diff_spec: str) -> bool:
+    return ".." in diff_spec
+
+
+def _diff_authors(repo_root: Path, diff_spec: str) -> tuple[set[str], bool]:
+    """Returns (author emails, is_pending) - is_pending means these are uncommitted
+    changes attributed to the current git identity, not an actual commit author yet."""
+    if _is_range_spec(diff_spec):
+        out = _git(repo_root, "log", "--format=%ae", diff_spec)
+        if out:
+            return {line.strip().lower() for line in out.splitlines() if line.strip()}, False
+    email = (_git(repo_root, "config", "user.email") or "").strip().lower()
+    return ({email} if email else set()), True
+
+
+def _file_history_authors(repo_root: Path, path: str) -> set[str]:
+    out = _git(repo_root, "log", "--format=%ae", "--", path)
+    if not out:
+        return set()
+    return {line.strip().lower() for line in out.splitlines() if line.strip()}
+
+
+def _commit_count_for_author(repo_root: Path, email: str) -> int:
+    out = _git(repo_root, "log", f"--author={email}", "--format=%H")
+    return len(out.splitlines()) if out else 0
+
+
+def check_author_anomaly(repo_root: Path, diff_spec: str) -> list[Finding]:
+    """Flag sensitive-path files touched by an author who has never touched that file
+    before. Cheap, deterministic, and a strong prior: a first-time editor of your auth
+    or CI config is worth a closer look, regardless of what the diff itself contains.
+
+    This is inherently approximate - for a commit-range spec, "history" is read from
+    the currently checked-out state, which may or may not exclude the range's own
+    commits depending on how the branches relate. Treat it as a heuristic, not proof.
+    """
+    touched_out = _git(repo_root, "diff", "--name-only", diff_spec)
+    if not touched_out:
+        return []
+    touched = [p for p in touched_out.splitlines() if p.strip()]
+    sensitive = [p for p in touched if _SENSITIVE_PATH_RE.search(p)]
+    if not sensitive:
+        return []
+
+    diff_authors, is_pending = _diff_authors(repo_root, diff_spec)
+    if not diff_authors:
+        return []
+
+    findings: list[Finding] = []
+    for path in sensitive:
+        history = _file_history_authors(repo_root, path)
+        if not history:
+            continue  # brand new file - nothing to compare against, not this check's concern
+        unfamiliar = diff_authors - history
+        if not unfamiliar:
+            continue
+        author = next(iter(unfamiliar))
+        commit_count = _commit_count_for_author(repo_root, author)
+        pending_note = " (uncommitted change - attributed to your current git identity)" if is_pending else ""
+        experience_note = (
+            f" This author has {commit_count} commit(s) in this repo overall."
+            if commit_count else
+            " This author has no other commits in this repo's visible history."
+        )
+        findings.append(Finding(
+            scanner="diff-heuristics", severity=Severity.MEDIUM, category="unfamiliar-author-sensitive-path",
+            file=path, line=None,
+            summary=f"{author} has never touched this security-sensitive file before in the visible "
+                    f"git history{pending_note}.{experience_note} Not inherently wrong (new team members "
+                    "touch security code too) but worth a second reviewer's eyes.",
+            confidence="low",
+        ))
     return findings

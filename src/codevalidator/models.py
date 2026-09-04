@@ -32,6 +32,7 @@ class Finding:
     line: int | None = None
     evidence: str | None = None  # short snippet, truncated - never the whole file
     confidence: str = "high"  # "high" | "medium" | "low"
+    provider: str | None = None  # which LLM provider produced this (scanner == "llm" only)
 
     def sort_key(self):
         return (-int(self.severity), self.file, self.line or 0)

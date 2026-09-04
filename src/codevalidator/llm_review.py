@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -81,7 +83,7 @@ class LLMBatchResult(BaseModel):
     files_with_no_findings: list[str]
 
 
-def _to_finding(lf: LLMFinding) -> Finding:
+def _to_finding(lf: LLMFinding, provider: str) -> Finding:
     return Finding(
         scanner="llm",
         severity=Severity.parse(lf.severity),
@@ -91,7 +93,36 @@ def _to_finding(lf: LLMFinding) -> Finding:
         summary=lf.summary,
         evidence=lf.evidence[:300],
         confidence=lf.confidence,
+        provider=provider,
     )
+
+
+_CORROBORATION_LINE_TOLERANCE = 5
+
+
+def cross_check(findings: list[Finding]) -> None:
+    """Annotate (in place) LLM findings independently corroborated by more than one
+    provider on the same file, near the same line. Never removes or downgrades a
+    finding - a real issue caught by only one model must never disappear because the
+    other model missed it. Corroboration only ever adds confidence, never subtracts it."""
+    llm_findings = [f for f in findings if f.scanner == "llm" and f.provider and f.line is not None]
+    by_file: dict[str, list[Finding]] = {}
+    for f in llm_findings:
+        by_file.setdefault(f.file, []).append(f)
+
+    for file_findings in by_file.values():
+        for i, a in enumerate(file_findings):
+            if "confirmed independently by" in a.summary:
+                continue
+            corroborators = {
+                b.provider for b in file_findings
+                if b is not a and b.provider != a.provider and abs((b.line or 0) - (a.line or 0)) <= _CORROBORATION_LINE_TOLERANCE
+            }
+            if corroborators:
+                all_providers = sorted({a.provider, *corroborators})
+                a.summary += f" (confirmed independently by both {' and '.join(all_providers)})"
+                if a.confidence != "high":
+                    a.confidence = "high"
 
 
 def _scope_check_block(intent: str) -> str:
@@ -172,7 +203,7 @@ def review_repo(
         if result is None:
             failed_batches += 1
             continue
-        findings.extend(_to_finding(lf) for lf in result.findings)
+        findings.extend(_to_finding(lf, provider) for lf in result.findings)
 
     if truncated_repo:
         findings.append(Finding(
@@ -246,7 +277,67 @@ def review_diff(
         if result is None:
             failed_batches += 1
             continue
-        findings.extend(_to_finding(lf) for lf in result.findings)
+        findings.extend(_to_finding(lf, provider) for lf in result.findings)
 
     _append_failed_batch_finding(findings, failed_batches, len(chunks))
     return findings, usage
+
+
+ALL_PROVIDERS = list(providers.DEFAULT_MODELS)
+
+
+def _run_multi(provider_calls: dict[str, Callable[[], tuple[list[Finding], TokenUsage]]]) -> tuple[list[Finding], list[TokenUsage]]:
+    """Runs one call per provider; a provider that's unavailable (missing/bad
+    credentials) is skipped with a warning finding rather than aborting the whole
+    cross-check - you still get results from whichever provider(s) actually worked."""
+    findings: list[Finding] = []
+    usages: list[TokenUsage] = []
+    unavailable: list[str] = []
+    for provider, call in provider_calls.items():
+        try:
+            provider_findings, usage = call()
+        except LLMUnavailable as e:
+            print(f"warning: skipping {provider} in cross-check ({e})", file=sys.stderr)
+            unavailable.append(provider)
+            continue
+        findings.extend(provider_findings)
+        usages.append(usage)
+
+    if unavailable and usages:
+        findings.append(Finding(
+            scanner="llm", severity=Severity.INFO, category="partial-cross-check",
+            file="(repo)",
+            summary=f"--llm-provider both was requested, but {', '.join(unavailable)} was unavailable - "
+                    f"results below are from {', '.join(u.provider for u in usages)} only, with no "
+                    "cross-model corroboration.",
+            confidence="high",
+        ))
+    elif unavailable and not usages:
+        raise LLMUnavailable(f"All requested providers were unavailable: {', '.join(unavailable)}")
+
+    cross_check(findings)
+    return findings, usages
+
+
+def review_repo_multi(
+    ctx: ScanContext,
+    llm_providers: list[str] | None = None,
+    max_files: int = DEFAULT_MAX_FILES,
+) -> tuple[list[Finding], list[TokenUsage]]:
+    """Run the whole-repo review through multiple providers and cross-check results."""
+    return _run_multi({
+        provider: (lambda p=provider: review_repo(ctx, provider=p, max_files=max_files))
+        for provider in (llm_providers or ALL_PROVIDERS)
+    })
+
+
+def review_diff_multi(
+    repo_root: Path, diff_spec: str,
+    llm_providers: list[str] | None = None,
+    intent: str | None = None,
+) -> tuple[list[Finding], list[TokenUsage]]:
+    """Run the diff review through multiple providers and cross-check results."""
+    return _run_multi({
+        provider: (lambda p=provider: review_diff(repo_root, diff_spec, provider=p, intent=intent))
+        for provider in (llm_providers or ALL_PROVIDERS)
+    })

@@ -1,4 +1,8 @@
-from codevalidator.diff_heuristics import check_test_tampering
+import subprocess
+
+import pytest
+
+from codevalidator.diff_heuristics import check_author_anomaly, check_test_tampering
 
 _REMOVED_ASSERTION_WITH_PROD_CHANGE = '''diff --git a/tests/test_auth.py b/tests/test_auth.py
 index 111..222 100644
@@ -66,3 +70,50 @@ def test_ignores_clean_non_test_diff():
 
 def test_ignores_empty_diff():
     assert check_test_tampering("") == []
+
+
+def _git(repo, *args):
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+
+
+def _init_repo(repo, author_name, author_email):
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", author_name)
+    _git(repo, "config", "user.email", author_email)
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo, "Alice", "alice@example.com")
+    (repo / "src").mkdir()
+    (repo / "src" / "auth.py").write_text("def login():\n    pass\n")
+    (repo / "src" / "util.py").write_text("def helper():\n    pass\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "initial auth by alice")
+    return repo
+
+
+def test_author_anomaly_flags_unfamiliar_author_on_sensitive_file(git_repo):
+    _git(git_repo, "config", "user.name", "Mallory")
+    _git(git_repo, "config", "user.email", "mallory@example.com")
+    (git_repo / "src" / "auth.py").write_text("def login():\n    return True  # backdoor\n")
+
+    findings = check_author_anomaly(git_repo, "HEAD")
+    assert len(findings) == 1
+    assert findings[0].category == "unfamiliar-author-sensitive-path"
+    assert findings[0].file == "src/auth.py"
+    assert "mallory@example.com" in findings[0].summary
+
+
+def test_author_anomaly_ignores_familiar_author(git_repo):
+    (git_repo / "src" / "auth.py").write_text("def login():\n    return True\n")  # still alice
+    assert check_author_anomaly(git_repo, "HEAD") == []
+
+
+def test_author_anomaly_ignores_non_sensitive_file(git_repo):
+    _git(git_repo, "config", "user.name", "Mallory")
+    _git(git_repo, "config", "user.email", "mallory@example.com")
+    (git_repo / "src" / "util.py").write_text("def helper():\n    return 42\n")
+    assert check_author_anomaly(git_repo, "HEAD") == []
