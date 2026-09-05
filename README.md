@@ -27,6 +27,51 @@ stated intent is the strongest signal this tool has. Whole-repo scanning still w
 (and the heuristic scanners are useful defense-in-depth on their own), but a full-repo
 LLM pass is the weakest and most expensive way to use this tool.
 
+## See it in action
+
+Say a diff quietly adds a debug backdoor to a login check, and neuters the test that
+would have caught it:
+
+```diff
+--- a/src/auth.py
++++ b/src/auth.py
+@@ -1,5 +1,5 @@
+ def login(username, password):
+     user = find_user(username)
+-    if not check_password(user, password):
++    if not check_password(user, password) or username == "debug_override":
+         return LoginResult(success=False, status_code=401)
+     return LoginResult(success=True)
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -1,5 +1,4 @@
+ def test_login_rejects_bad_password():
+     user = create_user("alice", "correct-horse")
+     result = login("alice", "wrong-password")
+-    assert result.success is False
+     assert result.status_code == 401
+```
+
+`codevalidator . --diff HEAD --no-llm` (heuristics only, no API key needed) catches it:
+
+```
+[HIGH] tests/test_auth.py:4  (diff-heuristics/test-weakened, confidence=low)
+  A test assertion was removed in this diff. This diff also touches non-test files,
+  which is the pattern to worry about most - confirm the weakened test wasn't hiding
+  a real behavior change.
+  > assert result.success is False
+
+[MEDIUM] src/auth.py  (diff-heuristics/unfamiliar-author-sensitive-path, confidence=low)
+  mallory@example.com has never touched this security-sensitive file before in the
+  visible git history. This author has no other commits in this repo's visible
+  history. Not inherently wrong but worth a second reviewer's eyes.
+```
+
+That's the deterministic layer alone - no LLM call, no cost. Add `--llm-provider
+anthropic` (or `mistral`, or `both`) and the semantic pass independently flags the
+`debug_override` condition itself as a hardcoded auth bypass, usually with higher
+confidence than either heuristic on its own.
+
 ## Install
 
 ```bash
@@ -113,6 +158,38 @@ evidence, confidence) and deduped/sorted into a single report:
    estimate**, since hardcoded pricing drifts out of date or varies by account.
    Failed batches (rate limits, API errors) are called out explicitly rather than
    silently producing an incomplete "no findings" report.
+
+## Using it in CI
+
+`action.yml` at the repo root packages this as a reusable GitHub Action, so a
+consuming repo doesn't need to install anything itself:
+
+```yaml
+name: codevalidator
+on: pull_request
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed so the diff can reach the PR base commit
+
+      - uses: larsmw/codevalidator@main  # pin to a tag once you've picked one
+        with:
+          intent: ${{ github.event.pull_request.title }}
+          llm-provider: anthropic
+          fail-on: high
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+With no LLM secret configured, drop `llm: false` in as an input and it still runs
+the deterministic layer (test-tampering, author-anomaly, all the heuristic scanners)
+for free. On a `pull_request` from a fork, secrets aren't available to the workflow
+by default anyway - the action degrades to heuristics-only automatically rather than
+failing, per the graceful-degradation behavior described above.
 
 ## Known limitations
 

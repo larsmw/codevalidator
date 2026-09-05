@@ -1,0 +1,93 @@
+name: 'codevalidator'
+description: 'Diff-focused review that catches backdoors and hidden changes slipped into code'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  path:
+    description: 'Repository path to scan'
+    required: false
+    default: '.'
+  diff:
+    description: >
+      git diff spec to review (e.g. base...head). Defaults to the pull request's
+      base...head when running on a pull_request event, otherwise HEAD. Requires
+      actions/checkout with fetch-depth: 0 (or enough depth to include the base
+      commit) beforehand - a shallow checkout can't diff against the base.
+    required: false
+    default: ''
+  intent:
+    description: 'Stated purpose of the change (e.g. the PR title/description) for the scope-creep check'
+    required: false
+    default: ''
+  llm:
+    description: 'Run the LLM review pass (true/false). Needs ANTHROPIC_API_KEY and/or MISTRAL_API_KEY set as env on this step.'
+    required: false
+    default: 'true'
+  llm-provider:
+    description: 'anthropic | mistral | both'
+    required: false
+    default: 'anthropic'
+  fail-on:
+    description: 'Minimum severity that fails this step: never|info|low|medium|high|critical'
+    required: false
+    default: 'high'
+  format:
+    description: 'Report format: text|json|markdown'
+    required: false
+    default: 'text'
+  codevalidator-ref:
+    description: 'git ref of larsmw/codevalidator to install - pin this for reproducibility'
+    required: false
+    default: 'main'
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install codevalidator
+      shell: bash
+      env:
+        CV_REF: ${{ inputs.codevalidator-ref }}
+      run: pip install "git+https://github.com/larsmw/codevalidator.git@${CV_REF}"
+
+    - name: Determine diff spec
+      id: diffspec
+      shell: bash
+      env:
+        CV_DIFF: ${{ inputs.diff }}
+        CV_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        CV_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        if [ -n "$CV_DIFF" ]; then
+          spec="$CV_DIFF"
+        elif [ -n "$CV_BASE_SHA" ] && [ -n "$CV_HEAD_SHA" ]; then
+          spec="${CV_BASE_SHA}...${CV_HEAD_SHA}"
+        else
+          spec="HEAD"
+        fi
+        echo "spec=$spec" >> "$GITHUB_OUTPUT"
+
+    - name: Run codevalidator
+      shell: bash
+      env:
+        CV_PATH: ${{ inputs.path }}
+        CV_DIFF_SPEC: ${{ steps.diffspec.outputs.spec }}
+        CV_INTENT: ${{ inputs.intent }}
+        CV_LLM: ${{ inputs.llm }}
+        CV_PROVIDER: ${{ inputs.llm-provider }}
+        CV_FAIL_ON: ${{ inputs.fail-on }}
+        CV_FORMAT: ${{ inputs.format }}
+      run: |
+        args=("$CV_PATH" --diff "$CV_DIFF_SPEC" --llm-provider "$CV_PROVIDER" --fail-on "$CV_FAIL_ON" --format "$CV_FORMAT")
+        if [ "$CV_LLM" = "false" ]; then
+          args+=(--no-llm)
+        fi
+        if [ -n "$CV_INTENT" ]; then
+          args+=(--intent "$CV_INTENT")
+        fi
+        codevalidator "${args[@]}"
