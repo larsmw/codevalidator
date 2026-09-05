@@ -176,7 +176,7 @@ jobs:
         with:
           fetch-depth: 0  # needed so the diff can reach the PR base commit
 
-      - uses: larsmw/codevalidator@main  # pin to a tag once you've picked one
+      - uses: larsmw/codevalidator@v1
         with:
           intent: ${{ github.event.pull_request.title }}
           llm-provider: anthropic
@@ -184,6 +184,34 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
+
+### GitLab, Gitea, or anything else
+
+`action.yml` is just a thin GitHub Actions wrapper - the CLI itself has no GitHub
+dependency (no GitHub API calls, no `GITHUB_*` env vars read anywhere in
+`src/codevalidator/`), so it runs the same way on any CI that can `pip install` and
+has `git`. There's no maintained wrapper for other platforms; the pattern is always
+"install, then compute the diff spec from whatever that CI calls base/head":
+
+```yaml
+# .gitlab-ci.yml
+codevalidator:
+  stage: test
+  variables:
+    GIT_DEPTH: 0  # full history, so the diff can reach the MR's target branch
+  script:
+    - pip install "git+https://github.com/larsmw/codevalidator.git@v1"
+    - codevalidator . --diff "$CI_MERGE_REQUEST_DIFF_BASE_SHA...$CI_MERGE_REQUEST_DIFF_HEAD_SHA"
+        --intent "$CI_MERGE_REQUEST_TITLE" --fail-on high
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+```
+
+Gitea Actions is close enough to GitHub Actions syntax that `action.yml` may work
+there with little to no change (own `.gitea/workflows/` directory, same `uses:`/
+`run:`/`with:` shape). Bitbucket Pipelines, Jenkins, or a local pre-commit hook: same
+`pip install` + `codevalidator . --diff <base>...<head>`, just swap in that system's
+own predefined variables for the base/head refs.
 
 With no LLM secret configured, drop `llm: false` in as an input and it still runs
 the deterministic layer (test-tampering, author-anomaly, all the heuristic scanners)
