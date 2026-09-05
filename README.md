@@ -1,5 +1,8 @@
 # codevalidator
 
+[![test](https://github.com/larsmw/codevalidator/actions/workflows/test.yml/badge.svg)](https://github.com/larsmw/codevalidator/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A diff-focused code review helper for catching things *deliberately or accidentally
 hidden* in a change - a backdoor slipped in by an LLM coding assistant, a compromised
 contributor, or a supply-chain compromise. Combines fast deterministic checks with an
